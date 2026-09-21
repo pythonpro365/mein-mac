@@ -1,5 +1,5 @@
 name: macos-with-vnc
-on: 
+on:
   workflow_dispatch:
 defaults:
   run:
@@ -11,17 +11,191 @@ jobs:
     steps:
 
     - name: Checkout repository
-      uses: actions/checkout@v2
-    
-    - name: Setting the environment up.
+      uses: actions/checkout@v4
+
+    - name: Prevent display sleep
+      run: |
+        set -Eeuo pipefail
+
+        echo "===== 1. Current console user ====="
+        stat -f "%Su" /dev/console || true
+
+        echo "===== 2. Disable screensaver ====="
+        defaults -currentHost write com.apple.screensaver idleTime 0 || true
+        defaults write com.apple.screensaver idleTime 0 || true
+
+        echo "===== 3. Disable display sleep ====="
+        sudo pmset -a displaysleep 0
+        sudo pmset -a sleep 0
+        sudo pmset -a disksleep 0
+        sudo pmset -a womp 1 || true
+
+        echo "===== 4. Start caffeinate in background ====="
+        nohup caffeinate -disu > /tmp/caffeinate.log 2>&1 &
+        disown
+        sleep 2
+        ps aux | grep caffeinate | grep -v grep || true
+
+        echo "Display bleibt jetzt wach."
+
+    - name: Create dedicated VNC user
       env:
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
         VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+      run: |
+        set -Eeuo pipefail
+
+        echo "===== 1. Create user 'vncuser' ====="
+        # Home anlegen, User anlegen
+        sudo mkdir -p /Users/vncuser
+        sudo chown -R 501:20 /Users/vncuser 2>/dev/null || true
+
+        # User mit sysadminctl anlegen
+        sudo sysadminctl -addUser vncuser \
+          -fullName "VNC User" \
+          -password "$VNC_USER_PASSWORD" \
+          -home /Users/vncuser \
+          -shell /bin/bash \
+          -admin || {
+            echo "::warning::sysadminctl -addUser fehlgeschlagen, versuche dscl"
+            # Fallback via dscl
+            sudo dscl . -create /Users/vncuser
+            sudo dscl . -create /Users/vncuser UserShell /bin/bash
+            sudo dscl . -create /Users/vncuser RealName "VNC User"
+            sudo dscl . -create /Users/vncuser UniqueID 550
+            sudo dscl . -create /Users/vncuser PrimaryGroupID 20
+            sudo dscl . -create /Users/vncuser NFSHomeDirectory /Users/vncuser
+            sudo dscl . -passwd /Users/vncuser "$VNC_USER_PASSWORD"
+            sudo createhomedir -c -u vncuser || true
+          }
+
+        echo "===== 2. Verify user exists ====="
+        id vncuser || dscl . -read /Users/vncuser || true
+
+        echo "===== 3. Grant admin ====="
+        sudo dseditgroup -o edit -a vncuser -t user admin || true
+        sudo dseditgroup -o edit -a vncuser -t user _developer || true
+
+    - name: Setup VNC (Screen Sharing with legacy password)
+      env:
         VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-      run: source configure.sh "$VNC_USER_PASSWORD" "$VNC_PASSWORD" "$NGROK_AUTH_TOKEN"
-    
-    - name: ngrok is now listening to VNC connections on...
-      run: curl --silent http://127.0.0.1:4040/api/tunnels | jq '.tunnels[0].public_url'
-    
-    - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v2
+      run: |
+        set -Eeuo pipefail
+
+        echo "===== 0. Grant Screen Recording + Control + Input via TCC ====="
+        TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
+
+        sudo sqlite3 "$TCCDB" "SELECT service FROM access LIMIT 1;" || echo "TCC.db nicht lesbar"
+
+        for SERVICE in kTCCServiceScreenCapture kTCCServiceRemoteDesktop kTCCServicePostEvent kTCCServiceListenEvent kTCCServiceAccessibility; do
+          for CLIENT in com.apple.screensharing.agent com.apple.RemoteDesktop.agent /System/Library/CoreServices/RemoteManagement/ARDAgent.app; do
+            sudo sqlite3 "$TCCDB" "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version) VALUES ('$SERVICE', '$CLIENT', 0, 2, 2, 1);" 2>/dev/null || true
+          done
+        done
+
+        echo "TCC permissions gesetzt."
+
+        echo "===== 1. Enable macOS Screen Sharing with legacy VNC password ====="
+        sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+          -activate -configure -access -on \
+          -restart -agent -privs -all \
+          -allowAccessFor -allUsers \
+          -clientopts -setvnclegacy -vnclegacy yes \
+          -clientopts -setvncpw -vncpw "$VNC_PASSWORD"
+
+        echo "===== 2. Restart ARD agent ====="
+        sudo killall ARDAgent 2>/dev/null || true
+        sleep 2
+        sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
+
+        echo "===== 3. Verify VNC is listening ====="
+        sleep 3
+        sudo lsof -iTCP:5900 -sTCP:LISTEN || true
+
+        echo "VNC aktiviert."
+
+    - name: Setup Tailscale (CLI, macOS)
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        set -Eeuo pipefail
+
+        brew uninstall --cask tailscale-app 2>/dev/null || true
+        brew uninstall --cask tailscale 2>/dev/null || true
+
+        brew install tailscale
+
+        TAILSCALED="$(command -v tailscaled || true)"
+        TAILSCALE_CLI="$(command -v tailscale || true)"
+
+        if [[ -z "$TAILSCALED" ]]; then
+          TAILSCALED="$(find /opt/homebrew /usr/local -name tailscaled -type f 2>/dev/null | head -n1 || true)"
+        fi
+        if [[ -z "$TAILSCALE_CLI" ]]; then
+          TAILSCALE_CLI="$(find /opt/homebrew /usr/local -name tailscale -type f 2>/dev/null | head -n1 || true)"
+        fi
+
+        echo "tailscaled : $TAILSCALED"
+        echo "tailscale  : $TAILSCALE_CLI"
+
+        if [[ -z "$TAILSCALED" || -z "$TAILSCALE_CLI" ]]; then
+          echo "::error::Tailscale binaries nicht gefunden."
+          exit 1
+        fi
+
+        sudo mkdir -p /var/lib/tailscale /var/run/tailscale
+        sudo "$TAILSCALED" \
+          --tun=userspace-networking \
+          --state=/var/lib/tailscale/tailscaled.state \
+          --socket=/var/run/tailscale/tailscaled.sock \
+          > /tmp/tailscaled.log 2>&1 &
+        disown
+
+        sleep 8
+
+        if ! sudo test -S /var/run/tailscale/tailscaled.sock; then
+          echo "::error::tailscaled socket nicht vorhanden."
+          cat /tmp/tailscaled.log || true
+          exit 1
+        fi
+
+        sudo "$TAILSCALE_CLI" \
+          --socket=/var/run/tailscale/tailscaled.sock \
+          up \
+          --authkey="$TAILSCALE_AUTH_KEY" \
+          --hostname="gha-macos-vnc" \
+          --timeout=45s \
+          --reset || {
+            echo "::error::tailscale up fehlgeschlagen oder Timeout."
+            cat /tmp/tailscaled.log || true
+            exit 1
+          }
+
+        sudo "$TAILSCALE_CLI" --socket=/var/run/tailscale/tailscaled.sock status
+
+    - name: Show connection info
+      run: |
+        set -Eeuo pipefail
+
+        TAILSCALE_CLI="$(command -v tailscale || find /opt/homebrew /usr/local -name tailscale -type f 2>/dev/null | head -n1 || true)"
+
+        echo "=========================================="
+        echo "         VNC CONNECTION INFO"
+        echo "=========================================="
+        TS_IP="$(sudo "$TAILSCALE_CLI" --socket=/var/run/tailscale/tailscaled.sock ip -4 | head -n1 || true)"
+        echo "Address  : $TS_IP"
+        echo "Port     : 5900"
+        echo ""
+        echo "Login-Variante 1 (neu angelegter User):"
+        echo "  Benutzer : vncuser"
+        echo "  Passwort : (dein VNC_USER_PASSWORD Secret)"
+        echo ""
+        echo "Login-Variante 2 (Standard-User):"
+        echo "  Benutzer : Anka"
+        echo "  Passwort : (leer lassen und Enter)"
+        echo ""
+        echo "TigerVNC command:"
+        echo "  .\\vncviewer.exe -SecurityTypes=VncAuth $TS_IP:5900"
+        echo "=========================================="
+
+    - name: Keep session alive (tmate)
+      uses: mxschmitt/action-tmate@v3
